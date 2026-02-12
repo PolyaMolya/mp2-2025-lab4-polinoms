@@ -22,12 +22,6 @@ jobs:
         sudo apt-get install -y clang-format
         echo "clang-format version: $(clang-format --version)"
         
-    - name: Generate clang-format style guide
-      run: |
-        echo "Generating style guide reference..."
-        clang-format --style=Google --dump-config > .clang-format-reference
-        echo "Style guide saved to .clang-format-reference"
-        
     - name: Find C++ files
       id: find_files
       run: |
@@ -39,97 +33,180 @@ jobs:
         echo "$CPP_FILES" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
         
-    - name: Check formatting and show specific violations
+    - name: Check formatting with error patterns
       id: check_format
       run: |
         ERROR_COUNT=0
         UNFORMATTED_FILES=""
-        VIOLATIONS=""
         
-        # Функция для определения типа нарушения форматирования
-        detect_violation() {
-          local file=$1
-          local line=$2
-          local column=$3
-          
-          if echo "$line" | grep -q "char \*\*"; then
-            echo "Pointer alignment: 'char **' should be 'char**' (no space between * and variable name)"
-          elif echo "$line" | grep -q "\*\*[a-zA-Z]"; then
-            echo "Pointer alignment: Space between ** and variable name"
-          elif echo "$line" | grep -q ")$"; then
-            echo "Function parenthesis: No space between ) and { on same line"
-          elif echo "$line" | grep -q "^[a-zA-Z].*([^)]*)[^{]*$"; then
-            echo "Function brace style: Opening brace should be on the same line"
-          elif echo "$line" | grep -q "^\s*for.*("; then
-            echo "For loop formatting: Check spaces around semicolons and parenthesis"
-          elif echo "$line" | grep -q "^\s*if.*("; then
-            echo "If statement formatting: Space between if and ("
-          elif echo "$line" | grep -q "^\s*switch.*("; then
-            echo "Switch statement formatting: Space between switch and ("
-          elif echo "$line" | grep -q "^\s*while.*("; then
-            echo "While statement formatting: Space between while and ("
-          elif echo "$line" | grep -q "\s\+$"; then
-            echo "Trailing whitespace at end of line"
-          elif echo "$line" | grep -q "^namespace"; then
-            echo "Namespace formatting: Check indentation"
-          elif echo "$line" | grep -q "^\s*public:" || echo "$line" | grep -q "^\s*private:" || echo "$line" | grep -q "^\s*protected:"; then
-            echo "Access specifier: Should be indented (usually 1 space for Google style)"
-          elif echo "$line" | grep -q "^\s*class.*{"; then
-            echo "Class brace style: Opening brace on same line or new line?"
-          elif echo "$line" | grep -q "^\s*\*\s\+\w"; then
-            echo "Pointer declaration: '*' should be adjacent to type or variable name"
-          elif echo "$line" | grep -q "^\s*&\s\+\w"; then
-            echo "Reference declaration: '&' should be adjacent to type or variable name"
-          elif echo "$file" | grep -q "\.h$" && echo "$line" | grep -q "^\s*[a-zA-Z].*(.*).*{$"; then
-            echo "Inline function in header: Check if function body is on separate line"
-          else
-            echo "General code style violation"
-          fi
-        }
+        # Паттерны ошибок для clang-format
+        ERROR_PATTERNS=(
+          "POINTER_ALIGNMENT"
+          "REFERENCE_ALIGNMENT" 
+          "BRACE_PLACEMENT"
+          "SPACE_BEFORE_PAREN"
+          "SPACE_AROUND_OPERATORS"
+          "INDENTATION"
+          "TRAILING_WHITESPACE"
+          "ACCESS_SPECIFIER"
+          "NAMESPACE_INDENT"
+          "LINE_LENGTH"
+          "COMMENT_SPACING"
+          "TAB_CHARACTER"
+          "INCLUDE_ORDER"
+          "ELSE_NEWLINE"
+          "EMPTY_BLOCK"
+          "TEMPLATE_FORMATTING"
+          "LAMBDA_FORMATTING"
+        )
         
         while IFS= read -r file; do
           if [ -n "$file" ]; then
             echo ""
+            echo "FILE: $file"
             echo "----------------------------------------"
-            echo "Checking: $file"
-            echo "----------------------------------------"
             
-            # Создаем отформатированную версию
-            clang-format "$file" > "/tmp/$(basename "$file").formatted"
+            # Проверяем форматирование и получаем ошибки
+            clang-format -n "$file" 2>clang_output.tmp || true
             
-            # Построчно сравниваем и находим различия
-            LINE_NUM=0
-            VIOLATION_FOUND=false
-            
-            while IFS= read -r original_line; do
-              LINE_NUM=$((LINE_NUM + 1))
-              formatted_line=$(sed -n "${LINE_NUM}p" "/tmp/$(basename "$file").formatted")
-              
-              if [ "$original_line" != "$formatted_line" ] && [ -n "$original_line" ]; then
-                VIOLATION_FOUND=true
-                VIOLATION_TYPE=$(detect_violation "$file" "$original_line")
-                
-                echo ""
-                echo "  VIOLATION at line $LINE_NUM:"
-                echo "  Rule: $VIOLATION_TYPE"
-                echo ""
-                echo "    Current:  $original_line"
-                echo "    Required: $formatted_line"
-                echo ""
-                echo "    How to fix:"
-                echo "      clang-format -i $file"
-                echo "      # or edit line $LINE_NUM manually"
-                echo ""
-              fi
-            done < "$file"
-            
-            if [ "$VIOLATION_FOUND" = true ]; then
+            # Анализируем ошибки clang-format
+            if [ -s clang_output.tmp ]; then
               ERROR_COUNT=$((ERROR_COUNT + 1))
               UNFORMATTED_FILES="$UNFORMATTED_FILES\n- $file"
               
-              echo "  SUMMARY for $file:"
-              echo "  This file contains formatting violations"
-              echo "  Run: clang-format -i $file"
+              echo "ERROR_PATTERN: FORMATTING_VIOLATION"
+              echo "FILE: $file"
+              
+              # Парсим вывод clang-format и классифицируем ошибки
+              while IFS= read -r error_line; do
+                if echo "$error_line" | grep -q "code should be clang-formatted"; then
+                  LINE_NUM=$(echo "$error_line" | grep -o ":[0-9]*:" | grep -o "[0-9]*")
+                  COL_NUM=$(echo "$error_line" | grep -o ":[0-9]*:" | tail -1 | grep -o "[0-9]*")
+                  
+                  # Получаем конкретную строку из файла
+                  PROBLEM_LINE=$(sed -n "${LINE_NUM}p" "$file")
+                  FIXED_LINE=$(clang-format "$file" | sed -n "${LINE_NUM}p")
+                  
+                  # Классифицируем тип ошибки
+                  ERROR_TYPE="UNKNOWN"
+                  if echo "$PROBLEM_LINE" | grep -q "\*\*[a-zA-Z]"; then
+                    ERROR_TYPE="POINTER_ALIGNMENT"
+                    ERROR_DESC="Pointer alignment: '**' should be adjacent to type or variable name"
+                    FIX_DESC="Remove space between ** and variable name"
+                  elif echo "$PROBLEM_LINE" | grep -q "char \*\*"; then
+                    ERROR_TYPE="POINTER_ALIGNMENT"
+                    ERROR_DESC="Pointer alignment: 'char **' should be 'char**'"
+                    FIX_DESC="Remove space between * and variable name"
+                  elif echo "$PROBLEM_LINE" | grep -q " \*[a-zA-Z]"; then
+                    ERROR_TYPE="POINTER_ALIGNMENT"
+                    ERROR_DESC="Pointer alignment: Space between * and variable name"
+                    FIX_DESC="Remove space: '*var' should be '*var'"
+                  elif echo "$PROBLEM_LINE" | grep -q "int \*"; then
+                    ERROR_TYPE="POINTER_ALIGNMENT"
+                    ERROR_DESC="Pointer alignment: 'int *' should be 'int*'"
+                    FIX_DESC="Move '*' to the type"
+                  elif echo "$PROBLEM_LINE" | grep -q "&[a-zA-Z]"; then
+                    ERROR_TYPE="REFERENCE_ALIGNMENT"
+                    ERROR_DESC="Reference alignment: '&' should be adjacent to type"
+                    FIX_DESC="Move '&' to the type: 'int& var'"
+                  elif echo "$PROBLEM_LINE" | grep -q "[a-zA-Z0-9)] {"; then
+                    ERROR_TYPE="BRACE_PLACEMENT"
+                    ERROR_DESC="Brace placement: Opening brace should be on the same line"
+                    FIX_DESC="Move '{' to the same line: ') {'"
+                  elif echo "$PROBLEM_LINE" | grep -q "^[a-zA-Z].*)\s*$"; then
+                    ERROR_TYPE="BRACE_PLACEMENT"
+                    ERROR_DESC="Brace placement: Opening brace on new line"
+                    FIX_DESC="Move '{' to the previous line"
+                  elif echo "$PROBLEM_LINE" | grep -q "if("; then
+                    ERROR_TYPE="SPACE_BEFORE_PAREN"
+                    ERROR_DESC="Space before parenthesis: Missing space between 'if' and '('"
+                    FIX_DESC="Add space: 'if ('"
+                  elif echo "$PROBLEM_LINE" | grep -q "for("; then
+                    ERROR_TYPE="SPACE_BEFORE_PAREN"
+                    ERROR_DESC="Space before parenthesis: Missing space between 'for' and '('"
+                    FIX_DESC="Add space: 'for ('"
+                  elif echo "$PROBLEM_LINE" | grep -q "while("; then
+                    ERROR_TYPE="SPACE_BEFORE_PAREN"
+                    ERROR_DESC="Space before parenthesis: Missing space between 'while' and '('"
+                    FIX_DESC="Add space: 'while ('"
+                  elif echo "$PROBLEM_LINE" | grep -q "switch("; then
+                    ERROR_TYPE="SPACE_BEFORE_PAREN"
+                    ERROR_DESC="Space before parenthesis: Missing space between 'switch' and '('"
+                    FIX_DESC="Add space: 'switch ('"
+                  elif echo "$PROBLEM_LINE" | grep -q "catch("; then
+                    ERROR_TYPE="SPACE_BEFORE_PAREN"
+                    ERROR_DESC="Space before parenthesis: Missing space between 'catch' and '('"
+                    FIX_DESC="Add space: 'catch ('"
+                  elif echo "$PROBLEM_LINE" | grep -q "\s\+$"; then
+                    ERROR_TYPE="TRAILING_WHITESPACE"
+                    ERROR_DESC="Trailing whitespace at end of line"
+                    FIX_DESC="Remove spaces at the end of line"
+                  elif echo "$PROBLEM_LINE" | grep -q "^public:"; then
+                    ERROR_TYPE="ACCESS_SPECIFIER"
+                    ERROR_DESC="Access specifier indentation: 'public:' should be indented"
+                    FIX_DESC="Add indentation (1 or 2 spaces)"
+                  elif echo "$PROBLEM_LINE" | grep -q "^private:"; then
+                    ERROR_TYPE="ACCESS_SPECIFIER"
+                    ERROR_DESC="Access specifier indentation: 'private:' should be indented"
+                    FIX_DESC="Add indentation (1 or 2 spaces)"
+                  elif echo "$PROBLEM_LINE" | grep -q "^protected:"; then
+                    ERROR_TYPE="ACCESS_SPECIFIER"
+                    ERROR_DESC="Access specifier indentation: 'protected:' should be indented"
+                    FIX_DESC="Add indentation (1 or 2 spaces)"
+                  elif echo "$PROBLEM_LINE" | grep -q "^namespace.*{"; then
+                    ERROR_TYPE="NAMESPACE_INDENT"
+                    ERROR_DESC="Namespace indentation: Content should be indented"
+                    FIX_DESC="Indent namespace content"
+                  elif echo "$PROBLEM_LINE" | grep -q "^class.*{"; then
+                    ERROR_TYPE="CLASS_FORMATTING"
+                    ERROR_DESC="Class definition formatting"
+                    FIX_DESC="Check class brace placement and indentation"
+                  elif echo "$PROBLEM_LINE" | grep -q "^\s*for.*;.*;.*{$"; then
+                    ERROR_TYPE="SPACE_AROUND_OPERATORS"
+                    ERROR_DESC="For loop formatting: Missing spaces around operators"
+                    FIX_DESC="Add spaces: 'for (int i = 0; i < n; i++)'"
+                  elif echo "$PROBLEM_LINE" | grep -q "^\s*if.*==.*"; then
+                    ERROR_TYPE="SPACE_AROUND_OPERATORS"
+                    ERROR_DESC="Operator spacing: Missing spaces around '=='"
+                    FIX_DESC="Add spaces: 'x == y'"
+                  elif echo "$PROBLEM_LINE" | grep -q "^\s*if.*!="; then
+                    ERROR_TYPE="SPACE_AROUND_OPERATORS"
+                    ERROR_DESC="Operator spacing: Missing spaces around '!='"
+                    FIX_DESC="Add spaces: 'x != y'"
+                  elif echo "$PROBLEM_LINE" | grep -q "^\s*//[^ ]"; then
+                    ERROR_TYPE="COMMENT_SPACING"
+                    ERROR_DESC="Comment spacing: Missing space after //"
+                    FIX_DESC="Add space: '// comment'"
+                  elif echo "$PROBLEM_LINE" | grep -q "\t"; then
+                    ERROR_TYPE="TAB_CHARACTER"
+                    ERROR_DESC="Tab character detected. Use spaces for indentation"
+                    FIX_DESC="Replace tabs with spaces (2 spaces per tab)"
+                  elif echo "$PROBLEM_LINE" | grep -q "^\s*}[^,]?else"; then
+                    ERROR_TYPE="ELSE_NEWLINE"
+                    ERROR_DESC="Else statement formatting"
+                    FIX_DESC="Format as: '} else {'"
+                  elif echo "$PROBLEM_LINE" | grep -q "template<"; then
+                    ERROR_TYPE="TEMPLATE_FORMATTING"
+                    ERROR_DESC="Template declaration formatting"
+                    FIX_DESC="Add space: 'template <typename T>'"
+                  elif echo "$PROBLEM_LINE" | grep -q "\[&\]"; then
+                    ERROR_TYPE="LAMBDA_FORMATTING"
+                    ERROR_DESC="Lambda capture formatting"
+                    FIX_DESC="Check lambda capture syntax"
+                  fi
+                  
+                  echo "  ERROR_PATTERN: $ERROR_TYPE"
+                  echo "  ERROR_FILE: $file"
+                  echo "  ERROR_LINE: $LINE_NUM"
+                  echo "  ERROR_COLUMN: $COL_NUM"
+                  echo "  ERROR_DESC: $ERROR_DESC"
+                  echo "  ERROR_CODE: \"$PROBLEM_LINE\""
+                  echo "  FIXED_CODE: \"$FIXED_LINE\""
+                  echo "  HOW_TO_FIX: $FIX_DESC"
+                  echo "  FIX_COMMAND: clang-format -i $file"
+                  echo "---"
+                fi
+              done < clang_output.tmp
             else
               echo "  PASS: $file is properly formatted"
             fi
@@ -139,82 +216,27 @@ jobs:
         if [ $ERROR_COUNT -gt 0 ]; then
           echo ""
           echo "========================================="
-          echo "FORMATTING ERRORS SUMMARY"
-          echo "========================================="
-          echo "Total unformatted files: $ERROR_COUNT"
-          echo ""
-          echo "Files with issues:"
+          echo "ERROR_PATTERN: FORMATTING_FAILURE"
+          echo "ERROR_SUMMARY: $ERROR_COUNT files need formatting"
+          echo "ERROR_FILES:"
           printf "%b\n" "$UNFORMATTED_FILES"
-          echo ""
-          echo "========================================="
-          echo "COMMON CLANG-FORMAT RULES"
           echo "========================================="
           echo ""
-          echo "Pointer/Reference alignment:"
-          echo "  WRONG: char **argv"
-          echo "  RIGHT: char** argv"
-          echo "  WRONG: int &x"
-          echo "  RIGHT: int& x"
+          echo "SEARCHABLE ERROR PATTERNS:"
+          echo "-----------------------------------------"
+          for pattern in "${ERROR_PATTERNS[@]}"; do
+            echo "  grep -n \"ERROR_PATTERN: $pattern\" output.txt"
+          done
+          echo "-----------------------------------------"
           echo ""
-          echo "Function brace style:"
-          echo "  WRONG: int main(int argc, char** argv) "
-          echo "        {"
-          echo "  RIGHT: int main(int argc, char** argv) {"
-          echo ""
-          echo "Control statements:"
-          echo "  WRONG: if(condition)"
-          echo "  RIGHT: if (condition)"
-          echo "  WRONG: for(int i=0;i<10;i++)"
-          echo "  RIGHT: for (int i = 0; i < 10; i++)"
-          echo ""
-          echo "Access specifiers:"
-          echo "  WRONG: public:"
-          echo "  RIGHT:   public: (indented)"
-          echo ""
-          echo "Indentation:"
-          echo "  Google style: 2 spaces"
-          echo "  LLVM style: 2 spaces"
-          echo "  Chromium style: 2 spaces"
-          echo ""
-          echo "========================================="
-          echo "QUICK FIX COMMANDS"
-          echo "========================================="
-          echo ""
-          echo "Fix single file:"
-          echo "  clang-format -i <filename>"
-          echo ""
-          echo "Fix all files in project:"
+          echo "QUICK FIX:"
           echo "  find . -name '*.cpp' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i"
-          echo ""
-          echo "Check what will be changed without modifying:"
-          echo "  clang-format -n <filename>"
           echo ""
           exit 1
         else
           echo ""
           echo "========================================="
-          echo "ALL FILES ARE PROPERLY FORMATTED"
+          echo "FORMATTING_CHECK: SUCCESS"
+          echo "All files are properly formatted"
           echo "========================================="
         fi
-        
-    - name: Generate formatting report
-      if: failure()
-      run: |
-        echo "Creating detailed formatting report..."
-        REPORT_FILE="formatting_errors_${{ github.sha }}.txt"
-        
-        {
-          echo "FORMATTING ERRORS REPORT"
-          echo "Commit: ${{ github.sha }}"
-          echo "Date: $(date)"
-          echo ""
-          echo "Summary: $ERROR_COUNT files need formatting"
-          echo ""
-          echo "Files to fix:"
-          printf "%b\n" "$UNFORMATTED_FILES"
-          echo ""
-          echo "To fix all issues run:"
-          echo "find . -name '*.cpp' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i"
-        } > "$REPORT_FILE"
-        
-        echo "Report saved to $REPORT_FILE"
