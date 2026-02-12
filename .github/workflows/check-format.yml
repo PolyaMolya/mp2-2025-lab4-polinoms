@@ -9,67 +9,212 @@ on:
 jobs:
   clang-format-check:
     name: Check Code Formatting
-    runs-on: ubuntu-latest  # Используем Linux контейнер
+    runs-on: ubuntu-latest
     
     steps:
-    # 1. Загружаем код из репозитория
     - name: Checkout code
       uses: actions/checkout@v3
       
-    # 2. Устанавливаем clang-format
     - name: Install clang-format
       run: |
+        echo "Installing clang-format..."
         sudo apt-get update
         sudo apt-get install -y clang-format
+        echo "clang-format version: $(clang-format --version)"
         
-    # 3. Проверяем форматирование
-    - name: Check formatting
+    - name: Generate clang-format style guide
       run: |
-        echo "Checking C++ files formatting..."
+        echo "Generating style guide reference..."
+        clang-format --style=Google --dump-config > .clang-format-reference
+        echo "Style guide saved to .clang-format-reference"
         
-        # Находим все C++ файлы и проверяем форматирование
-        # -n: только проверка, не изменять файлы
-        # -Werror: трактовать предупреждения как ошибки
-        find . -name "*.cpp" -o -name "*.h" -o -name "*.hpp" -o -name "*.c" | \
-          xargs clang-format -n -Werror --verbose
-        
-        echo "✅ All files are properly formatted!"
-        
-      # Если хотите более понятные сообщения об ошибках:
-    - name: Check formatting (with diff)
+    - name: Find C++ files
+      id: find_files
       run: |
-        echo "🔍 Checking code formatting..."
+        echo "Scanning for C++ files..."
+        CPP_FILES=$(find . -name "*.cpp" -o -name "*.h" -o -name "*.hpp" -o -name "*.c" -o -name "*.cc" -o -name "*.cxx" | grep -v "gtest" | grep -v "build/" | sort)
+        CPP_COUNT=$(echo "$CPP_FILES" | grep -c "^" || true)
+        echo "Found $CPP_COUNT C/C++ files"
+        echo "files<<EOF" >> $GITHUB_OUTPUT
+        echo "$CPP_FILES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
         
-        # Создаем временную копию файлов
-        mkdir -p /tmp/formatted
-        find . -name "*.cpp" -o -name "*.h" -o -name "*.hpp" -o -name "*.c" > /tmp/files.txt
+    - name: Check formatting and show specific violations
+      id: check_format
+      run: |
+        ERROR_COUNT=0
+        UNFORMATTED_FILES=""
+        VIOLATIONS=""
         
-        # Форматируем во временную директорию
-        while IFS= read -r file; do
-          if [ -f "$file" ]; then
-            clang-format "$file" > "/tmp/formatted/$(echo "$file" | tr '/' '_')"
+        # Функция для определения типа нарушения форматирования
+        detect_violation() {
+          local file=$1
+          local line=$2
+          local column=$3
+          
+          if echo "$line" | grep -q "char \*\*"; then
+            echo "Pointer alignment: 'char **' should be 'char**' (no space between * and variable name)"
+          elif echo "$line" | grep -q "\*\*[a-zA-Z]"; then
+            echo "Pointer alignment: Space between ** and variable name"
+          elif echo "$line" | grep -q ")$"; then
+            echo "Function parenthesis: No space between ) and { on same line"
+          elif echo "$line" | grep -q "^[a-zA-Z].*([^)]*)[^{]*$"; then
+            echo "Function brace style: Opening brace should be on the same line"
+          elif echo "$line" | grep -q "^\s*for.*("; then
+            echo "For loop formatting: Check spaces around semicolons and parenthesis"
+          elif echo "$line" | grep -q "^\s*if.*("; then
+            echo "If statement formatting: Space between if and ("
+          elif echo "$line" | grep -q "^\s*switch.*("; then
+            echo "Switch statement formatting: Space between switch and ("
+          elif echo "$line" | grep -q "^\s*while.*("; then
+            echo "While statement formatting: Space between while and ("
+          elif echo "$line" | grep -q "\s\+$"; then
+            echo "Trailing whitespace at end of line"
+          elif echo "$line" | grep -q "^namespace"; then
+            echo "Namespace formatting: Check indentation"
+          elif echo "$line" | grep -q "^\s*public:" || echo "$line" | grep -q "^\s*private:" || echo "$line" | grep -q "^\s*protected:"; then
+            echo "Access specifier: Should be indented (usually 1 space for Google style)"
+          elif echo "$line" | grep -q "^\s*class.*{"; then
+            echo "Class brace style: Opening brace on same line or new line?"
+          elif echo "$line" | grep -q "^\s*\*\s\+\w"; then
+            echo "Pointer declaration: '*' should be adjacent to type or variable name"
+          elif echo "$line" | grep -q "^\s*&\s\+\w"; then
+            echo "Reference declaration: '&' should be adjacent to type or variable name"
+          elif echo "$file" | grep -q "\.h$" && echo "$line" | grep -q "^\s*[a-zA-Z].*(.*).*{$"; then
+            echo "Inline function in header: Check if function body is on separate line"
+          else
+            echo "General code style violation"
           fi
-        done < /tmp/files.txt
+        }
         
-        # Сравниваем оригиналы с отформатированными
-        errors=0
         while IFS= read -r file; do
-          if [ -f "$file" ]; then
-            temp_name="/tmp/formatted/$(echo "$file" | tr '/' '_')"
-            if ! diff -u "$file" "$temp_name" > /dev/null; then
-              echo "❌ File needs formatting: $file"
-              echo "Diff:"
-              diff -u "$file" "$temp_name" || true
-              errors=$((errors + 1))
+          if [ -n "$file" ]; then
+            echo ""
+            echo "----------------------------------------"
+            echo "Checking: $file"
+            echo "----------------------------------------"
+            
+            # Создаем отформатированную версию
+            clang-format "$file" > "/tmp/$(basename "$file").formatted"
+            
+            # Построчно сравниваем и находим различия
+            LINE_NUM=0
+            VIOLATION_FOUND=false
+            
+            while IFS= read -r original_line; do
+              LINE_NUM=$((LINE_NUM + 1))
+              formatted_line=$(sed -n "${LINE_NUM}p" "/tmp/$(basename "$file").formatted")
+              
+              if [ "$original_line" != "$formatted_line" ] && [ -n "$original_line" ]; then
+                VIOLATION_FOUND=true
+                VIOLATION_TYPE=$(detect_violation "$file" "$original_line")
+                
+                echo ""
+                echo "  VIOLATION at line $LINE_NUM:"
+                echo "  Rule: $VIOLATION_TYPE"
+                echo ""
+                echo "    Current:  $original_line"
+                echo "    Required: $formatted_line"
+                echo ""
+                echo "    How to fix:"
+                echo "      clang-format -i $file"
+                echo "      # or edit line $LINE_NUM manually"
+                echo ""
+              fi
+            done < "$file"
+            
+            if [ "$VIOLATION_FOUND" = true ]; then
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+              UNFORMATTED_FILES="$UNFORMATTED_FILES\n- $file"
+              
+              echo "  SUMMARY for $file:"
+              echo "  This file contains formatting violations"
+              echo "  Run: clang-format -i $file"
+            else
+              echo "  PASS: $file is properly formatted"
             fi
           fi
-        done < /tmp/files.txt
+        done < <(echo "${{ steps.find_files.outputs.files }}")
         
-        if [ $errors -gt 0 ]; then
+        if [ $ERROR_COUNT -gt 0 ]; then
           echo ""
-          echo "⚠️  Found $errors file(s) with formatting issues!"
-          echo "💡 Run locally: find . -name '*.cpp' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i"
+          echo "========================================="
+          echo "FORMATTING ERRORS SUMMARY"
+          echo "========================================="
+          echo "Total unformatted files: $ERROR_COUNT"
+          echo ""
+          echo "Files with issues:"
+          printf "%b\n" "$UNFORMATTED_FILES"
+          echo ""
+          echo "========================================="
+          echo "COMMON CLANG-FORMAT RULES"
+          echo "========================================="
+          echo ""
+          echo "Pointer/Reference alignment:"
+          echo "  WRONG: char **argv"
+          echo "  RIGHT: char** argv"
+          echo "  WRONG: int &x"
+          echo "  RIGHT: int& x"
+          echo ""
+          echo "Function brace style:"
+          echo "  WRONG: int main(int argc, char** argv) "
+          echo "        {"
+          echo "  RIGHT: int main(int argc, char** argv) {"
+          echo ""
+          echo "Control statements:"
+          echo "  WRONG: if(condition)"
+          echo "  RIGHT: if (condition)"
+          echo "  WRONG: for(int i=0;i<10;i++)"
+          echo "  RIGHT: for (int i = 0; i < 10; i++)"
+          echo ""
+          echo "Access specifiers:"
+          echo "  WRONG: public:"
+          echo "  RIGHT:   public: (indented)"
+          echo ""
+          echo "Indentation:"
+          echo "  Google style: 2 spaces"
+          echo "  LLVM style: 2 spaces"
+          echo "  Chromium style: 2 spaces"
+          echo ""
+          echo "========================================="
+          echo "QUICK FIX COMMANDS"
+          echo "========================================="
+          echo ""
+          echo "Fix single file:"
+          echo "  clang-format -i <filename>"
+          echo ""
+          echo "Fix all files in project:"
+          echo "  find . -name '*.cpp' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i"
+          echo ""
+          echo "Check what will be changed without modifying:"
+          echo "  clang-format -n <filename>"
+          echo ""
           exit 1
         else
-          echo "✅ All files are properly formatted!"
+          echo ""
+          echo "========================================="
+          echo "ALL FILES ARE PROPERLY FORMATTED"
+          echo "========================================="
         fi
+        
+    - name: Generate formatting report
+      if: failure()
+      run: |
+        echo "Creating detailed formatting report..."
+        REPORT_FILE="formatting_errors_${{ github.sha }}.txt"
+        
+        {
+          echo "FORMATTING ERRORS REPORT"
+          echo "Commit: ${{ github.sha }}"
+          echo "Date: $(date)"
+          echo ""
+          echo "Summary: $ERROR_COUNT files need formatting"
+          echo ""
+          echo "Files to fix:"
+          printf "%b\n" "$UNFORMATTED_FILES"
+          echo ""
+          echo "To fix all issues run:"
+          echo "find . -name '*.cpp' -o -name '*.h' -o -name '*.hpp' | xargs clang-format -i"
+        } > "$REPORT_FILE"
+        
+        echo "Report saved to $REPORT_FILE"
